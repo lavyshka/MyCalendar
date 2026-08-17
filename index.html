@@ -1365,6 +1365,242 @@ $("authPass").addEventListener("keydown",e=>{if(e.key==="Enter")window.__cloud.s
   check();
 })();
 </script>
+<!-- ===== ПАТЧ: корректный подсчёт баланса по дате начала ===== -->
+<script>
+(function(){
+  // 1. Добавить поле "Первое занятие" в модалку урока
+  var lessonModal = document.getElementById('mLesson');
+  if(lessonModal){
+    var startInput = lessonModal.querySelector('#lessonStart');
+    if(startInput && !document.getElementById('lessonStartDate')){
+      var container = startInput.closest('.frow');
+      if(container){
+        var div = document.createElement('div');
+        div.innerHTML = '<label>Первое занятие</label><input type="date" id="lessonStartDate">';
+        container.appendChild(div);
+      }
+    }
+  }
 
+  // 2. Вычислить ближайший день недели от сегодня
+  function nextWeekday(targetDow){
+    var d = new Date(); d.setHours(0,0,0,0);
+    var cur = (d.getDay()+6)%7 + 1;
+    var diff = (targetDow - cur + 7) % 7;
+    d.setDate(d.getDate() + diff);
+    return d;
+  }
+  function toISO(d){
+    var p = function(n){return String(n).padStart(2,'0')};
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+  }
+
+  // 3. Патчим openLessonModal: автозаполнение даты
+  if(window.openLessonModal){
+    var origOpen = window.openLessonModal;
+    window.openLessonModal = function(id, prefillDay){
+      origOpen(id, prefillDay);
+      var daySel = document.getElementById('lessonDay');
+      var sdField = document.getElementById('lessonStartDate');
+      if(sdField){
+        if(id){
+          var l = state.lessons.find(function(x){return String(x.id)===String(id)});
+          sdField.value = l && l.startDate ? l.startDate : '';
+        } else {
+          var day = prefillDay || +daySel.value || 1;
+          sdField.value = toISO(nextWeekday(day));
+        }
+      }
+    };
+  }
+
+  // 4. При смене дня недели в модалке — пересчитываем дату
+  var daySel = document.getElementById('lessonDay');
+  if(daySel){
+    daySel.addEventListener('change', function(){
+      var sdField = document.getElementById('lessonStartDate');
+      var lid = document.getElementById('lessonId').value;
+      if(sdField && !lid){
+        sdField.value = toISO(nextWeekday(+daySel.value || 1));
+      }
+    });
+  }
+
+  // 5. Патчим saveLesson: сохраняем startDate
+  if(window.saveLesson){
+    var origSave = window.saveLesson;
+    window.saveLesson = function(){
+      var sdField = document.getElementById('lessonStartDate');
+      var lid = document.getElementById('lessonId').value;
+      var day = +document.getElementById('lessonDay').value;
+      var start = document.getElementById('lessonStart').value;
+      var end = document.getElementById('lessonEnd').value;
+      var studentId = document.getElementById('lessonStudent').value;
+      var err = document.getElementById('lessonErr');
+      if(!start || !end || !studentId){
+        err.textContent='⚠️ Заполните все поля'; err.style.display='block'; return;
+      }
+      if(start>=end){
+        err.textContent='⚠️ Окончание должно быть позже начала'; err.style.display='block'; return;
+      }
+      if(state.lessons.some(function(l){
+        return String(l.id)!==lid && l.day===day && start<l.end && end>l.start;
+      })){
+        err.textContent='⚠️ Ошибка времени: интервал пересекается с другим уроком!';
+        err.style.display='block'; return;
+      }
+      var startDate = sdField ? sdField.value : null;
+      if(lid){
+        Object.assign(state.lessons.find(function(l){return String(l.id)===lid}),
+          {day:day,start:start,end:end,studentId:studentId,startDate:startDate});
+      } else {
+        state.lessons.push({
+          id:Date.now(),day:day,start:start,end:end,studentId:studentId,
+          startDate:startDate, endDate:null, exceptions:[], overrides:[]
+        });
+      }
+      save(); renderAll(); closeModal('mLesson'); toast('✓ Урок сохранён');
+    };
+  }
+
+  // 6. НОВАЯ логика подсчёта баланса
+  function newStudentBalance(id){
+    var paid = state.payments.filter(function(p){return p.studentId===id})
+      .reduce(function(s,p){return s+(+p.count||0)}, 0);
+    var today = new Date(); today.setHours(0,0,0,0);
+    var spent = 0;
+
+    // Находим самую раннюю дату оплаты — это "начало учёта" для старых уроков
+    var firstPay = null;
+    state.payments.filter(function(p){return p.studentId===id}).forEach(function(p){
+      var d = fromISO(p.date);
+      if(!firstPay || d < firstPay) firstPay = d;
+    });
+
+    state.lessons.filter(function(l){return l.studentId===id}).forEach(function(l){
+      // Определяем "начальную дату" для подсчёта этого урока
+      var from;
+      if(l.startDate){
+        from = fromISO(l.startDate);
+      } else if(firstPay){
+        // Старый урок без startDate — начинаем с даты первой оплаты
+        from = firstPay;
+      } else {
+        // Нет ни startDate ни оплаты — считаем только с даты первого занятия ученика
+        // (в разумном окне)
+        from = new Date(today); from.setDate(from.getDate()-30);
+      }
+      if(from > today) return; // Урок начнётся в будущем
+      spent += occCount(l, from, today);
+    });
+    return paid - spent;
+  }
+
+  // Переопределяем глобальную функцию
+  if(window.studentBalance){
+    window.studentBalance = newStudentBalance;
+  }
+
+  // Пересчитать всё сразу
+  try{ renderAll(); }catch(e){}
+})();
+</script>
+
+<!-- ===== ПАТЧ: грейс-период оплаты до 10 числа ===== -->
+<script>
+(function(){
+  // Определяем: до 10 числа = льготный период
+  function isGracePeriod(){
+    return new Date().getDate() <= 10;
+  }
+
+  // ===== 1. Мягкий бейдж на чипах урока =====
+  if(window.chip){
+    var origChip = window.chip;
+    window.chip = function(l, ds){
+      var html = origChip(l, ds);
+      if(isGracePeriod()){
+        // До 10 числа: если unpaid, меняем жёлтое "⚠ Не оплачено" на мягкое "⏳ Ждёт оплаты до 10 числа"
+        html = html.replace(
+          /<div class="chip-pay no">(.*?)<\/div>/g,
+          '<div class="chip-pay no">⏳ Ждёт оплаты до 10 числа</div>'
+        );
+        // И убираем тревожную жёлтую рамку
+        html = html.replace(/class="chip unpaid"/g, 'class="chip"');
+      }
+      return html;
+    };
+  }
+
+  // ===== 2. Дашборд: "Пора принять оплату" — только после 10 числа =====
+  if(window.renderDash){
+    var origRenderDash = window.renderDash;
+    window.renderDash = function(){
+      origRenderDash();
+      var lowBox = document.getElementById('dashLow');
+      if(!lowBox) return;
+
+      var grace = isGracePeriod();
+
+      if(grace){
+        // До 10 числа: показываем только напоминание, без тревожных бейджей
+        var items = state.students.map(function(s){
+          return {s:s, bal:state.studentBalance ? state.studentBalance(s.id) : 0};
+        }).filter(function(x){ return x.bal <= 1; })
+          .sort(function(a,b){ return a.bal - b.bal; });
+
+        if(items.length === 0){
+          lowBox.innerHTML = '<div class="empty"><div class="empty-ico">💳</div>У всех учеников достаточный баланс</div>';
+        } else {
+          lowBox.innerHTML =
+            '<div style="padding:12px 16px;border-radius:14px;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.3);margin-bottom:14px;font-weight:700;font-size:.94rem">' +
+            '📅 Грейс-период: родители могут оплатить до 10 числа. Напоминание появится после этой даты.' +
+            '</div>' +
+            '<div class="muted" style="font-size:.9rem;margin-bottom:8px">Учеников, ожидающих оплату: <b style="color:var(--txt)">' + items.length + '</b></div>' +
+            '<div class="dash-cols">' +
+            items.map(function(x){
+              return '<div class="rowline">' +
+                '<span>' + (x.s.emoji || '') + ' ' + x.s.name.replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]}) + '</span>' +
+                '<span class="badge proc">ост. ' + x.bal + ' зан.</span>' +
+                '</div>';
+            }).join('') +
+            '</div>';
+        }
+      }
+      // После 10 числа — работает оригинальная логика renderDash() без изменений
+    };
+  }
+
+  // ===== 3. Подсказка на вкладке "Оплата" =====
+  var payTab = document.querySelector('[data-sec="sec-pay"]');
+  if(payTab && !document.getElementById('graceBanner')){
+    var secPay = document.getElementById('sec-pay');
+    if(secPay){
+      var head = secPay.querySelector('.sec-head');
+      if(head){
+        var banner = document.createElement('div');
+        banner.id = 'graceBanner';
+        banner.style.cssText = 'padding:14px 18px;border-radius:16px;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.3);margin-bottom:18px;font-weight:700;font-size:.94rem;display:none';
+        secPay.insertBefore(banner, head.nextSibling);
+      }
+    }
+    setInterval(function(){
+      var b = document.getElementById('graceBanner');
+      if(!b) return;
+      if(isGracePeriod()){
+        var day = new Date().getDate();
+        b.style.display = 'block';
+        b.innerHTML = '💡 <b>Грейс-период активен.</b> Родители могут внести оплату за этот месяц до 10 числа. Сегодня ' + day + '-е число.';
+      } else {
+        b.style.display = 'none';
+      }
+    }, 1000);
+  }
+
+  // Перерисовать сразу
+  try{ renderAll(); }catch(e){}
+})();
+</script>
+  
 </body>
 </html>
