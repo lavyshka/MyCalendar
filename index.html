@@ -1601,6 +1601,76 @@ $("authPass").addEventListener("keydown",e=>{if(e.key==="Enter")window.__cloud.s
   try{ renderAll(); }catch(e){}
 })();
 </script>
+
+<!-- ===== ПАТЧ: исправление синхронизации (верный путь в Firestore) ===== -->
+<script type="module">
+import { getApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import { getAuth } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+
+let db=null, auth=null, uid=null, unsub=null, lastPush="";
+try{
+  const app=getApp();
+  db=getFirestore(app);
+  auth=getAuth(app);
+}catch(e){ console.warn("Sync-patch: Firebase не найден", e); }
+
+function refFor(u){ return doc(db,"users",u,"data","state"); }
+function dot(v){ const d=document.getElementById("syncDot"); if(d) d.textContent = v==="busy"?"⏳":v==="err"?"⚠️":"️"; }
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+
+function push(){
+  if(!uid||!db) return;
+  lastPush=JSON.stringify(window.__app.state());
+  dot("busy");
+  setDoc(refFor(uid),{state:window.__app.state(),updatedAt:Date.now()})
+    .then(()=>dot("ok"))
+    .catch(e=>{dot("err");console.error("Sync push error:",e);});
+}
+
+function attach(u){
+  if(unsub){unsub();unsub=null;}
+  unsub=onSnapshot(refFor(u),snap=>{
+    const current=JSON.stringify(window.__app.state());
+    if(!snap.exists()){
+      // Облако пустое — загружаем локальные данные
+      lastPush=current;
+      setDoc(refFor(u),{state:window.__app.state(),updatedAt:Date.now()}).then(()=>dot("ok")).catch(console.error);
+      return;
+    }
+    const remoteJson=JSON.stringify(snap.data().state);
+    if(remoteJson===current||remoteJson===lastPush){dot("ok");return;}
+    window.__app.apply(snap.data().state);
+    dot("ok");
+  },err=>{dot("err");console.error("Sync listen error:",err);});
+}
+
+// Исправляем блок "Пора принять оплату" на дашборде (корректный баланс)
+if(window.renderDash){
+  const prev=window.renderDash;
+  window.renderDash=function(){
+    prev();
+    const box=document.getElementById("dashLow");
+    if(!box||!window.studentBalance) return;
+    if(new Date().getDate()>10) return; // после 10 числа работает базовая логика
+    const items=state.students.map(s=>({s:s,bal:window.studentBalance(s.id)}))
+      .filter(x=>x.bal<=1).sort((a,b)=>a.bal-b.bal);
+    box.innerHTML = items.length
+      ? '<div style="padding:12px 16px;border-radius:14px;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.3);margin-bottom:14px;font-weight:700;font-size:.94rem">📅 Грейс-период: родители могут оплатить до 10 числа.</div>' +
+        '<div class="dash-cols">' + items.map(x=>'<div class="rowline"><span>'+(x.s.emoji||'')+' '+esc(x.s.name)+'</span><span class="badge proc">ост. '+x.bal+' зан.</span></div>').join('') + '</div>'
+      : '<div class="empty"><div class="empty-ico">💳</div>У всех учеников достаточный баланс</div>';
+  };
+}
+
+if(auth&&db){
+  if(window.__cloud) window.__cloud.push=push;
+  setInterval(()=>{
+    const u=auth.currentUser;
+    if(u&&u.uid!==uid){ uid=u.uid; attach(uid); if(window.__cloud) window.__cloud.push=push; }
+    if(!u&&uid){ uid=null; if(unsub){unsub();unsub=null;} }
+  },1200);
+}
+</script>
   
 </body>
 </html>
